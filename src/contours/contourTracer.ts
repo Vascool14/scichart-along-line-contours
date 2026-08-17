@@ -16,24 +16,6 @@ export type TContourPolyline = {
     isClosed: boolean;
 };
 
-/**
- * Options for {@link traceContours}
- */
-export type TContourTraceOptions = {
-    /** First column index to trace, inclusive */
-    iStart: number;
-    /** Last column index to trace, inclusive */
-    iEnd: number;
-    /** First row index to trace, inclusive */
-    jStart: number;
-    /** Last row index to trace, inclusive */
-    jEnd: number;
-    /** Only every strideX-th column is sampled. Use > 1 when cells are smaller than a pixel */
-    strideX: number;
-    /** Only every strideY-th row is sampled. Use > 1 when cells are smaller than a pixel */
-    strideY: number;
-};
-
 /** Per-level accumulator used while marching over the cells. @ignore */
 type TLevelBuffer = {
     level: number;
@@ -50,13 +32,13 @@ type TLevelBuffer = {
 };
 
 /**
- * Builds the list of sample indices covering `[start, end]` with the given stride.
+ * Builds the list of sample indices covering `[0, end]` with the given stride.
  * `end` is always included so the traced region covers the full requested window.
  * @ignore
  */
-const buildSampleIndices = (start: number, end: number, stride: number): number[] => {
+const buildSampleIndices = (end: number, stride: number): number[] => {
     const indices: number[] = [];
-    for (let i = start; i < end; i += stride) {
+    for (let i = 0; i < end; i += stride) {
         indices.push(i);
     }
     indices.push(end);
@@ -141,13 +123,9 @@ const walkPolyline = (buffer: TLevelBuffer, visited: Uint8Array, startEdge: numb
         edge = nextEdge;
         const candidateA = buffer.segA.get(edge);
         const candidateB = buffer.segB.get(edge);
-        if (candidateA !== undefined && !visited[candidateA]) {
-            seg = candidateA;
-        } else if (candidateB !== undefined && !visited[candidateB]) {
-            seg = candidateB;
-        } else {
-            seg = undefined;
-        }
+        seg = candidateA !== undefined && !visited[candidateA]
+            ? candidateA
+            : candidateB !== undefined && !visited[candidateB] ? candidateB : undefined;
     }
     return points;
 };
@@ -155,12 +133,10 @@ const walkPolyline = (buffer: TLevelBuffer, visited: Uint8Array, startEdge: numb
 /** Stitches the segments of one level into polylines. @ignore */
 const stitchLevel = (buffer: TLevelBuffer): TContourPolyline[] => {
     const segCount = buffer.segEdges.length / 2;
-    if (segCount === 0) return [];
     const visited = new Uint8Array(segCount);
     const result: TContourPolyline[] = [];
 
     const emit = (points: number[]) => {
-        if (points.length < 4) return;
         const isClosed = points[0] === points[points.length - 2] && points[1] === points[points.length - 1];
         result.push({ level: buffer.level, points, isClosed });
     };
@@ -169,12 +145,10 @@ const stitchLevel = (buffer: TLevelBuffer): TContourPolyline[] => {
     // An edge touched by a single segment is an open end (it lies on the border of the traced region).
     for (let seg = 0; seg < segCount; seg++) {
         if (visited[seg]) continue;
-        for (let slot = 0; slot < 2; slot++) {
-            const edge = buffer.segEdges[seg * 2 + slot];
-            if (buffer.segB.has(edge)) continue;
-            emit(walkPolyline(buffer, visited, edge, seg));
-            break;
-        }
+        const edge0 = buffer.segEdges[seg * 2];
+        const edge1 = buffer.segEdges[seg * 2 + 1];
+        const openEnd = !buffer.segB.has(edge0) ? edge0 : !buffer.segB.has(edge1) ? edge1 : undefined;
+        if (openEnd !== undefined) emit(walkPolyline(buffer, visited, openEnd, seg));
     }
     // Anything left is a closed loop, which can be started anywhere.
     for (let seg = 0; seg < segCount; seg++) {
@@ -189,7 +163,7 @@ const stitchLevel = (buffer: TLevelBuffer): TContourPolyline[] => {
  * requested level in a single pass over the cells.
  * @param zValues the heatmap values, indexed `[row][column]`
  * @param levels the z levels to trace. Order does not matter - each polyline carries its own level
- * @param options the region and sampling stride, see {@link TContourTraceOptions}
+ * @param stride only every stride-th row and column is sampled
  * @remarks
  * The traced geometry matches what {@link UniformContoursDrawingProvider} draws: the contour
  * surface is the bilinear interpolation of the z values, sampled at the grid points.
@@ -197,11 +171,12 @@ const stitchLevel = (buffer: TLevelBuffer): TContourPolyline[] => {
 export const traceContours = (
     zValues: NumberArray[],
     levels: number[],
-    options: TContourTraceOptions
+    stride: number
 ): TContourPolyline[] => {
-    if (!zValues?.length || !levels?.length) return [];
-    const xs = buildSampleIndices(options.iStart, options.iEnd, Math.max(1, options.strideX));
-    const ys = buildSampleIndices(options.jStart, options.jEnd, Math.max(1, options.strideY));
+    if (!zValues?.length || !zValues[0]?.length || !levels?.length) return [];
+    stride = Math.max(1, stride);
+    const xs = buildSampleIndices(zValues[0].length - 1, stride);
+    const ys = buildSampleIndices(zValues.length - 1, stride);
     const nx = xs.length;
     const ny = ys.length;
     if (nx < 2 || ny < 2) return [];
@@ -236,14 +211,8 @@ export const traceContours = (
             // producing a contour through undefined data.
             if (v00 !== v00 || v10 !== v10 || v11 !== v11 || v01 !== v01) continue;
 
-            let min = v00;
-            let max = v00;
-            if (v10 < min) min = v10;
-            else if (v10 > max) max = v10;
-            if (v11 < min) min = v11;
-            else if (v11 > max) max = v11;
-            if (v01 < min) min = v01;
-            else if (v01 > max) max = v01;
+            const min = Math.min(v00, v10, v11, v01);
+            const max = Math.max(v00, v10, v11, v01);
 
             // With "corner is above" defined as value > level, a cell contains a crossing
             // exactly when min <= level < max.
@@ -298,16 +267,10 @@ export const traceContours = (
                         }
                         break;
                     }
-                    default:
-                        break;
                 }
             }
         }
     }
 
-    const polylines: TContourPolyline[] = [];
-    for (const buffer of buffers) {
-        polylines.push(...stitchLevel(buffer));
-    }
-    return polylines;
+    return buffers.flatMap(stitchLevel);
 };
